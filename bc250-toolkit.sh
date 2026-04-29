@@ -1241,14 +1241,26 @@ run_status() {
     echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
 
     local OVERRIDE_FILE="/etc/plasmalogin.conf.d/zzz-bc250-boot.conf"
-    local CONF_DIR="/etc/plasmalogin.conf.d"
-    local boot_mode="${BOLD}${GREEN}Game Mode${RESET}"
+    local boot_session="gamescope"
+    local boot_relogin="true"
     if [[ -f "$OVERRIDE_FILE" ]]; then
-        grep -q "plasma.desktop" "$OVERRIDE_FILE" && boot_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
-    else
-        grep -rq "plasma.desktop" "$CONF_DIR"/*.conf 2>/dev/null && boot_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
+        grep -q "plasma.desktop" "$OVERRIDE_FILE" && boot_session="plasma"
+        grep -q "User=$" "$OVERRIDE_FILE"  && boot_relogin="false"
     fi
-    echo -e "  ${CYAN}Boot Mode${RESET}         ${boot_mode}"
+
+    local boot_mode boot_login
+    if [[ "$boot_session" == "gamescope" ]]; then
+        boot_mode="${BOLD}${GREEN}Game Mode${RESET}"
+    else
+        boot_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
+    fi
+    if [[ "$boot_relogin" == "false" ]]; then
+        boot_login="${DIM}password required${RESET}"
+    else
+        boot_login="${DIM}no password${RESET}"
+    fi
+
+    echo -e "  ${CYAN}Boot Mode${RESET}         ${boot_mode}  ${boot_login}"
     echo -e "  ${CYAN}Kernel${RESET}            $(uname -r)"
     echo ""
 
@@ -1321,6 +1333,15 @@ run_status() {
     swappiness=$(cat /proc/sys/vm/swappiness 2>/dev/null || echo "N/A")
     echo -e "  ${CYAN}Swappiness${RESET}         ${swappiness}"
 
+    # Swapfile
+    local swapfile_color swapfile_status
+    if [[ -f "/var/swap/swapfile" ]]; then
+        swapfile_status="${GREEN}present${RESET}"
+    else
+        swapfile_status="${DIM}not found${RESET}"
+    fi
+    echo -e "  ${CYAN}Swapfile${RESET}           ${swapfile_status}"
+
     # Swap Devices (Filtered to avoid empty/inactive lines)
     echo -e "  ${CYAN}Swap Devices${RESET}"
     local swap_output
@@ -1332,6 +1353,16 @@ run_status() {
             echo -e "    ${DIM}${name}  ${type}  size=${size}  used=${used}  prio=${prio}${RESET}"
         done
     fi
+    echo ""
+
+    # --- Disk Space ---
+    echo -e "  ${BOLD}${YELLOW}Disk Space${RESET}"
+    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
+    local df_root df_boot
+    df_root=$(df -h / | awk 'NR==2 {printf "%s used of %s (%s free)", $3, $2, $4}')
+    df_boot=$(df -h /boot | awk 'NR==2 {printf "%s used of %s (%s free)", $3, $2, $4}')
+    echo -e "  ${CYAN}/${RESET}                 ${df_root}"
+    echo -e "  ${CYAN}/boot${RESET}             ${df_boot}"
     echo ""
 
     # --- Kernel Parameters ---
@@ -1354,20 +1385,6 @@ run_status() {
     else
         echo -e "  ${RED}$LIMINE_CONF not found${RESET}"
     fi
-    echo ""
-
-    # --- ACPI Fix ---
-    echo -e "  ${BOLD}${YELLOW}ACPI Fix${RESET}"
-    echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
-    local acpi_cpio acpi_hook acpi_inject acpi_injected
-    [[ -f "/boot/bc250_acpi.cpio" ]] && acpi_cpio="${GREEN}present${RESET}" || acpi_cpio="${RED}not found${RESET}"
-    [[ -f "/etc/pacman.d/hooks/bc250-acpi-fix.hook" ]] && acpi_hook="${GREEN}installed${RESET}" || acpi_hook="${RED}not installed${RESET}"
-    [[ -f "/usr/local/bin/bc250-acpi-inject.sh" ]] && acpi_inject="${GREEN}installed${RESET}" || acpi_inject="${RED}not installed${RESET}"
-    grep -q "bc250_acpi.cpio" /boot/limine.conf 2>/dev/null && acpi_injected="${GREEN}yes${RESET}" || acpi_injected="${RED}no${RESET}"
-    echo -e "  ${CYAN}CPIO archive${RESET}      ${acpi_cpio}"
-    echo -e "  ${CYAN}In limine.conf${RESET}    ${acpi_injected}"
-    echo -e "  ${CYAN}Pacman hook${RESET}       ${acpi_hook}"
-    echo -e "  ${CYAN}Inject script${RESET}     ${acpi_inject}"
     echo ""
 
     echo -e "  ${BOLD}${CYAN}══════════════════════════════════════════════════════════════${RESET}"
