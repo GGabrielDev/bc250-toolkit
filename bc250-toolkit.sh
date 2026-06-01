@@ -267,83 +267,184 @@ run_disable_zram_enable_zswap() {
 }
 
 run_toggle_boot_mode() {
-    print_step "12" "Toggle Boot Mode"
+    print_step "12" "Default Boot & Work Flavor Configuration (True TTY)"
 
-    local CONF_DIR="/etc/plasmalogin.conf.d"
-    local OVERRIDE_FILE="$CONF_DIR/zzz-bc250-boot.conf"
-    local USER_NAME="$REAL_USER"
+    local PREF_FILE="/etc/bc250-work-flavor.pref"
+    local TRANSITION_SCRIPT="/usr/local/bin/bc250-tty-transition.sh"
+    local SUDOERS_FILE="/etc/sudoers.d/bc250-tty"
+    local WRAPPER_BIN="/usr/bin/steamos-session-select"
+    local ORIG_BIN="/usr/bin/steamos-session-select.orig"
+    local flavor
 
-    # --- DETECTION ---
-    local current_session="gamescope"
-    local current_relogin="true"
-    if [[ -f "$OVERRIDE_FILE" ]]; then
-        grep -q "plasma.desktop" "$OVERRIDE_FILE" && current_session="plasma"
-        grep -q "Relogin=false"  "$OVERRIDE_FILE" && current_relogin="false"
+    # Keep only one known baseline flavor state.
+    mkdir -p "$(dirname "$PREF_FILE")"
+    [[ ! -f "$PREF_FILE" ]] && echo "plasma" > "$PREF_FILE"
+
+    # --- Detached transition script used for true TTY flavor ---
+    cat > "$TRANSITION_SCRIPT" <<'EOF'
+#!/bin/bash
+systemctl isolate multi-user.target
+sleep 5
+systemctl stop plugin_loader.service 2>/dev/null || true
+pkill -9 -f "PluginLoader" 2>/dev/null || true
+
+for uid in $(ls /run/user/ 2>/dev/null); do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    user=$(id -un "$uid" 2>/dev/null || true)
+    [[ -n "$user" ]] || continue
+    sudo -u "$user" XDG_RUNTIME_DIR=/run/user/"$uid" systemctl --user stop sunshine.service 2>/dev/null || true
+    sudo -u "$user" XDG_RUNTIME_DIR=/run/user/"$uid" systemctl --user stop plasma-kdeconnect.service 2>/dev/null || true
+    pkill -u "$user" -9 -f "homebrew/plugins" 2>/dev/null || true
+    pkill -u "$user" -9 -f "kdeconnectd" 2>/dev/null || true
+done
+EOF
+    chmod +x "$TRANSITION_SCRIPT"
+
+    # --- Passwordless rules required by wrapper-driven mode switches ---
+    cat > "$SUDOERS_FILE" <<EOF
+Defaults:$REAL_USER !requiretty
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemd-run --unit=bc250-tty-drop --property=IgnoreOnIsolate=yes $TRANSITION_SCRIPT, /usr/bin/systemctl isolate multi-user.target, /usr/bin/systemctl isolate graphical.target, /usr/bin/systemctl set-default multi-user.target, /usr/bin/systemctl set-default graphical.target, /usr/bin/systemctl stop plugin_loader.service, /usr/bin/systemctl start plugin_loader.service
+EOF
+    chmod 440 "$SUDOERS_FILE"
+
+    # --- Wrapper install: preserve original and inject true TTY behavior ---
+    if [[ ! -f "$ORIG_BIN" ]]; then
+        if [[ ! -f "$WRAPPER_BIN" ]]; then
+            print_error "Missing $WRAPPER_BIN. Cannot configure boot mode."
+            return 1
+        fi
+        mv "$WRAPPER_BIN" "$ORIG_BIN"
     fi
 
-    local current_mode
-    if [[ "$current_session" == "gamescope" && "$current_relogin" == "true" ]]; then
-        current_mode="${BOLD}${GREEN}Game Mode — no password${RESET}"
-    elif [[ "$current_session" == "gamescope" && "$current_relogin" == "false" ]]; then
-        current_mode="${BOLD}${GREEN}Game Mode — password required${RESET}"
-    elif [[ "$current_session" == "plasma" && "$current_relogin" == "false" ]]; then
-        current_mode="${BOLD}${CYAN}Desktop Mode — password required${RESET}"
-    else
-        current_mode="${BOLD}${CYAN}Desktop Mode — no password${RESET}"
-    fi
+    cat > "$WRAPPER_BIN" <<EOF
+#!/bin/bash
+PREF_FILE="$PREF_FILE"
+FLAVOR=\$(cat "\$PREF_FILE" 2>/dev/null | tr -d ' \n' || echo "plasma")
+[[ "\$FLAVOR" == "plasma" || "\$FLAVOR" == "tty" ]] || FLAVOR="plasma"
 
-    echo -e "  ${CYAN}→${RESET}  Current: $current_mode"
+if [[ "\$1" == "plasma" && "\$FLAVOR" == "tty" ]]; then
+    sudo /usr/bin/systemd-run --unit=bc250-tty-drop --property=IgnoreOnIsolate=yes $TRANSITION_SCRIPT
+    exit 0
+fi
+
+if [[ "\$1" == "gamescope" || "\$1" == "oneshot" ]]; then
+    sudo /usr/bin/systemctl isolate graphical.target
+    sudo /usr/bin/systemctl start plugin_loader.service 2>/dev/null || true
+fi
+
+exec "$ORIG_BIN" "\$@"
+EOF
+    chmod +x "$WRAPPER_BIN"
+
+    flavor=$(cat "$PREF_FILE")
+    echo -e "  ${CYAN}Active Work Flavor:${RESET} ${BOLD}${WHITE}${flavor^^}${RESET}"
     echo ""
-    print_item "1" "Game Mode"         "No password — boot straight to Steam UI"
-    print_item "2" "Game Mode"         "Password required for desktop mode"
-    print_item "3" "Desktop Mode"      "Password required on boot"
-    print_item "4" "Desktop Mode"      "No password — autologin to Plasma"
+    print_section "1. Set Default Boot (On Startup)"
+    print_item "1" "Boot to Game Mode" "Start in Steam UI"
+    print_item "2" "Boot to Work Mode" "Start directly in $flavor"
     echo ""
-    print_item "0" "Back"              "Return to menu"
+    print_section "2. Work Flavor (Desktop Switch Button)"
+    print_item "3" "Flavor: Plasma" "Standard Desktop GUI"
+    print_item "4" "Flavor: TTY" "True headless mode (SSH-ready)"
+    echo ""
+    print_item "0" "Back" "Return to menu"
     echo ""
 
     read -rp "$(echo -e "  ${BOLD}${WHITE}Select choice:${RESET} ")" mode_choice
-
     case "$mode_choice" in
         1)
-            print_info "Switching to Game Mode (no password)..."
-            rm -f "$OVERRIDE_FILE"
-            print_success "Done. Reboot to apply."
+            systemctl set-default graphical.target
+            sudo -u "$REAL_USER" steamos-session-select oneshot 2>/dev/null || true
+            print_success "Default boot set to Game Mode."
             ;;
         2)
-            print_info "Switching to Game Mode (password required)..."
-            cat <<EOF > "$OVERRIDE_FILE"
-[Autologin]
-Relogin=false
-Session=gamescope-session.desktop
-User=$USER_NAME
-EOF
-            print_success "Done. Reboot to apply."
+            if [[ "$flavor" == "tty" ]]; then
+                setup_ssh_and_sunshine "cli"
+                systemctl set-default multi-user.target
+            else
+                systemctl set-default graphical.target
+                sudo -u "$REAL_USER" steamos-session-select persistent 2>/dev/null || true
+            fi
+            print_success "Default boot set to Work Mode ($flavor)."
             ;;
         3)
-            print_info "Switching to Desktop Mode (password required)..."
-            cat <<EOF > "$OVERRIDE_FILE"
-[Autologin]
-User=
-Session=plasma.desktop
-EOF
-            print_success "Done. Reboot to apply."
+            echo "plasma" > "$PREF_FILE"
+            print_success "Work Flavor set to Plasma."
+            return 0
             ;;
         4)
-            print_info "Switching to Desktop Mode (no password)..."
-            cat <<EOF > "$OVERRIDE_FILE"
-[Autologin]
-Relogin=true
-Session=plasma.desktop
-User=$USER_NAME
-EOF
-            print_success "Done. Reboot to apply."
+            echo "tty" > "$PREF_FILE"
+            setup_ssh_and_sunshine "cli"
+            print_success "Work Flavor set to True TTY (headless)."
+            return 0
             ;;
-        0|*)
+        0)
             print_info "No changes made."
             return 0
             ;;
+        *)
+            print_error "Invalid selection."
+            return 1
+            ;;
     esac
+
+    if confirm "Reboot now to apply changes?"; then
+        reboot
+    fi
+}
+
+get_user_shell_config() {
+    local user_home user_shell
+    user_home="$(getent passwd "$REAL_USER" | cut -d: -f6)"
+    user_shell="$(getent passwd "$REAL_USER" | cut -d: -f7)"
+
+    case "$user_shell" in
+        *fish) echo "$user_home/.config/fish/config.fish" ;;
+        *zsh)  echo "$user_home/.zshrc" ;;
+        *)     echo "$user_home/.bashrc" ;;
+    esac
+}
+
+setup_ssh_and_sunshine() {
+    local mode="$1"
+    local sshd_config="/etc/ssh/sshd_config"
+
+    if [[ "$mode" == "cli" ]]; then
+        print_info "Ensuring SSH is active for headless mode..."
+        sed -i '/^#\?PasswordAuthentication /d' "$sshd_config"
+        echo "PasswordAuthentication yes" >> "$sshd_config"
+        systemctl enable --now sshd
+        print_success "SSH enabled and password authentication enforced."
+    fi
+}
+
+run_setup_aliases() {
+    print_step "15" "Setting up 'tk', 'ss', 'ds', & 'ts' aliases"
+
+    local conf_file script_path desktop_selector
+    conf_file="$(get_user_shell_config)"
+    script_path="$(realpath "$0")"
+    desktop_selector="/usr/bin/steamos-session-select.orig"
+    [[ -x "$desktop_selector" ]] || desktop_selector="steamos-session-select"
+
+    mkdir -p "$(dirname "$conf_file")"
+    touch "$conf_file"
+
+    sed -i '/alias tk/d;/alias ss/d;/alias ds/d;/alias ts/d' "$conf_file" 2>/dev/null || true
+
+    if [[ "$conf_file" == *"config.fish" ]]; then
+        echo "alias tk 'sudo $script_path'" >> "$conf_file"
+        echo "alias ss 'sudo systemctl start plugin_loader.service; and sudo systemctl isolate graphical.target; and sleep 2; and steamos-session-select gamescope'" >> "$conf_file"
+        echo "alias ds 'sudo systemctl start plugin_loader.service; and sudo systemctl isolate graphical.target; and sleep 2; and $desktop_selector plasma'" >> "$conf_file"
+        echo "alias ts 'steamos-session-select plasma'" >> "$conf_file"
+    else
+        echo "alias tk='sudo $script_path'" >> "$conf_file"
+        echo "alias ss='sudo systemctl start plugin_loader.service && sudo systemctl isolate graphical.target && sleep 2 && steamos-session-select gamescope'" >> "$conf_file"
+        echo "alias ds='sudo systemctl start plugin_loader.service && sudo systemctl isolate graphical.target && sleep 2 && $desktop_selector plasma'" >> "$conf_file"
+        echo "alias ts='steamos-session-select plasma'" >> "$conf_file"
+    fi
+
+    print_success "Aliases set in $conf_file. Restart terminal/SSH to use."
 }
 
 run_switch_to_default_kernel() {
@@ -1513,18 +1614,25 @@ run_status() {
     echo -e "  ${DIM}──────────────────────────────────────────────────────────────${RESET}"
 
     local OVERRIDE_FILE="/etc/plasmalogin.conf.d/zzz-bc250-boot.conf"
+    local PREF_FILE="/etc/bc250-work-flavor.pref"
     local boot_session="gamescope"
     local boot_relogin="true"
+    local default_target work_flavor
     if [[ -f "$OVERRIDE_FILE" ]]; then
         grep -q "plasma.desktop" "$OVERRIDE_FILE" && boot_session="plasma"
-        grep -q "User=$" "$OVERRIDE_FILE"  && boot_relogin="false"
+        grep -q "Relogin=false" "$OVERRIDE_FILE" && boot_relogin="false"
     fi
+    default_target=$(systemctl get-default 2>/dev/null || echo "unknown")
+    work_flavor=$(cat "$PREF_FILE" 2>/dev/null | tr -d ' \n' || echo "plasma")
+    [[ "$work_flavor" == "plasma" || "$work_flavor" == "tty" ]] || work_flavor="plasma"
 
     local boot_mode boot_login
-    if [[ "$boot_session" == "gamescope" ]]; then
+    if [[ "$default_target" == "multi-user.target" ]]; then
+        boot_mode="${BOLD}${CYAN}Work Mode${RESET} ${DIM}(TTY)${RESET}"
+    elif [[ "$boot_session" == "gamescope" ]]; then
         boot_mode="${BOLD}${GREEN}Game Mode${RESET}"
     else
-        boot_mode="${BOLD}${CYAN}Desktop Mode${RESET}"
+        boot_mode="${BOLD}${CYAN}Work Mode${RESET} ${DIM}(Plasma)${RESET}"
     fi
     if [[ "$boot_relogin" == "false" ]]; then
         boot_login="${DIM}password required${RESET}"
@@ -1533,6 +1641,8 @@ run_status() {
     fi
 
     echo -e "  ${CYAN}Boot Mode${RESET}         ${boot_mode}  ${boot_login}"
+    echo -e "  ${CYAN}Work Flavor${RESET}       ${work_flavor}"
+    echo -e "  ${CYAN}Default Target${RESET}    ${default_target}"
     echo -e "  ${CYAN}Kernel${RESET}            $(uname -r)"
     echo ""
 
@@ -1806,8 +1916,9 @@ show_experimental_menu() {
     print_section "Additional Tools"
     echo -e "  ${DIM}Additional system utilities and hardware support.${RESET}\n"
     print_item  "1"  "CachyOS Kernel"    "Replace Deckify kernel with standard CachyOS"
-    print_item  "2"  "Toggle Boot Mode"  "Switch between Game Mode & Desktop"
-    print_item  "3"  "DolphinBar Setup"  "Install udev rules for Wiimote support via DolphinBar"
+    print_item  "2"  "Boot/Work Mode"    "Configure custom boot mode + work flavor"
+    print_item  "3"  "Setup Aliases"     "Add tk/ss/ds/ts aliases for quick mode switching"
+    print_item  "4"  "DolphinBar Setup"  "Install udev rules for Wiimote support via DolphinBar"
     echo ""
     print_item  "0"  "Back"             "Return to main menu"
     echo ""
@@ -1822,7 +1933,8 @@ run_experimental_menu() {
         case "${exp_choice^^}" in
             1) run_switch_to_default_kernel; press_enter ;;
             2) run_toggle_boot_mode;         press_enter ;;
-            3) run_dolphinbar_udev;          press_enter ;;
+            3) run_setup_aliases;            press_enter ;;
+            4) run_dolphinbar_udev;          press_enter ;;
             0)  return ;;
             *)
                 print_error "Invalid selection: '$exp_choice'"
