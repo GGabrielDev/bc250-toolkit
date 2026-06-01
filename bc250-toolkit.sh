@@ -277,6 +277,7 @@ run_toggle_boot_mode() {
     local flavor
 
     # Keep only one known baseline flavor state.
+    mkdir -p "$(dirname "$PREF_FILE")"
     [[ ! -f "$PREF_FILE" ]] && echo "plasma" > "$PREF_FILE"
 
     # --- Detached transition script used for true TTY flavor ---
@@ -288,7 +289,9 @@ systemctl stop plugin_loader.service 2>/dev/null || true
 pkill -9 -f "PluginLoader" 2>/dev/null || true
 
 for uid in $(ls /run/user/ 2>/dev/null); do
-    user=$(id -un "$uid")
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    user=$(id -un "$uid" 2>/dev/null || true)
+    [[ -n "$user" ]] || continue
     sudo -u "$user" XDG_RUNTIME_DIR=/run/user/"$uid" systemctl --user stop sunshine.service 2>/dev/null || true
     sudo -u "$user" XDG_RUNTIME_DIR=/run/user/"$uid" systemctl --user stop plasma-kdeconnect.service 2>/dev/null || true
     pkill -u "$user" -9 -f "homebrew/plugins" 2>/dev/null || true
@@ -300,7 +303,7 @@ EOF
     # --- Passwordless rules required by wrapper-driven mode switches ---
     cat > "$SUDOERS_FILE" <<EOF
 Defaults:$REAL_USER !requiretty
-$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemd-run, /usr/bin/systemctl isolate multi-user.target, /usr/bin/systemctl isolate graphical.target, /usr/bin/systemctl set-default multi-user.target, /usr/bin/systemctl set-default graphical.target, /usr/bin/systemctl stop plugin_loader.service, /usr/bin/systemctl start plugin_loader.service
+$REAL_USER ALL=(ALL) NOPASSWD: /usr/bin/systemd-run --unit=bc250-tty-drop --property=IgnoreOnIsolate=yes $TRANSITION_SCRIPT, /usr/bin/systemctl isolate multi-user.target, /usr/bin/systemctl isolate graphical.target, /usr/bin/systemctl set-default multi-user.target, /usr/bin/systemctl set-default graphical.target, /usr/bin/systemctl stop plugin_loader.service, /usr/bin/systemctl start plugin_loader.service
 EOF
     chmod 440 "$SUDOERS_FILE"
 
@@ -317,6 +320,7 @@ EOF
 #!/bin/bash
 PREF_FILE="$PREF_FILE"
 FLAVOR=\$(cat "\$PREF_FILE" 2>/dev/null | tr -d ' \n' || echo "plasma")
+[[ "\$FLAVOR" == "plasma" || "\$FLAVOR" == "tty" ]] || FLAVOR="plasma"
 
 if [[ "\$1" == "plasma" && "\$FLAVOR" == "tty" ]]; then
     sudo /usr/bin/systemd-run --unit=bc250-tty-drop --property=IgnoreOnIsolate=yes $TRANSITION_SCRIPT
@@ -407,11 +411,8 @@ setup_ssh_and_sunshine() {
 
     if [[ "$mode" == "cli" ]]; then
         print_info "Ensuring SSH is active for headless mode..."
-        sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication yes/' "$sshd_config"
-        sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' "$sshd_config"
-        if ! grep -q '^PasswordAuthentication yes' "$sshd_config"; then
-            echo "PasswordAuthentication yes" >> "$sshd_config"
-        fi
+        sed -i '/^#\?PasswordAuthentication /d' "$sshd_config"
+        echo "PasswordAuthentication yes" >> "$sshd_config"
         systemctl enable --now sshd
         print_success "SSH enabled and password authentication enforced."
     fi
@@ -429,7 +430,7 @@ run_setup_aliases() {
     mkdir -p "$(dirname "$conf_file")"
     touch "$conf_file"
 
-    sed -i '/alias tk/d;/alias ss/d;/alias ds/d;/alias ts/d;/→ Aliases:/d' "$conf_file" 2>/dev/null || true
+    sed -i '/alias tk/d;/alias ss/d;/alias ds/d;/alias ts/d' "$conf_file" 2>/dev/null || true
 
     if [[ "$conf_file" == *"config.fish" ]]; then
         echo "alias tk 'sudo $script_path'" >> "$conf_file"
@@ -1623,6 +1624,7 @@ run_status() {
     fi
     default_target=$(systemctl get-default 2>/dev/null || echo "unknown")
     work_flavor=$(cat "$PREF_FILE" 2>/dev/null | tr -d ' \n' || echo "plasma")
+    [[ "$work_flavor" == "plasma" || "$work_flavor" == "tty" ]] || work_flavor="plasma"
 
     local boot_mode boot_login
     if [[ "$default_target" == "multi-user.target" ]]; then
